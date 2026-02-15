@@ -4,4 +4,5 @@ Stores the files for my paper: Identification of Dominant Vibronic Relaxation Ch
 This will include:
 * Orca input files (geometry optimization / frequency file and property files)
 * Orca output files
+* Optimized geometry file (.xyz)
 * Redfield theory custom script
