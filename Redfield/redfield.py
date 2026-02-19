@@ -19,30 +19,33 @@ print("="*70)
 # Physical Constants & Parameters
 # ============================================================================
 
+# Constants
 h_bar = constants.hbar
 k_B = constants.k
 mu_N = constants.physical_constants['nuclear magneton'][0]  # J/T
 cm_inv_to_Hz = constants.c * 100
 MHz_to_Hz = 1e6
 
+# System parameters
 T = 4.2  # Kelvin
 I = 5/2  # Nuclear spin
 B_field = 0.0  # Tesla (zero field)
 g_N = 0.6134  # Eu-153
 
+# Experimental targets
 T1_experimental = 41.39  # seconds
 T2_experimental = 0.205e-6  # seconds (205 ns)
 
 # ORCA parameters
-e2qQ_h = 608.794743  # MHz
+e2qQ_h = -1858.043213  # MHz
 eta_Q = 0.940691
 A_iso = -9.9235  # MHz
 
 # Full hyperfine tensor from ORCA (in MHz)
 A_tensor = np.array([
-    [-9.9873,   3.7238,  -2.2211],
-    [ 3.8413, -12.6754,   1.4942],
-    [-2.2013,   1.4020,  -7.1077]
+    [62.4219,   24.6983,  -16.0468],
+    [ 24.6983, 42.4589,   2.7507],
+    [-16.0468,   2.7507,  63.7790]
 ])
 
 # Diagonalize to get principal values
@@ -65,6 +68,7 @@ huang_rhys_modes = [
 ]
 
 # Nuclear spin bath: nearby spins causing spectral diffusion
+# Coordinates from ORCA (Angstrom), relative to Eu at origin
 bath_spins = [
     # Format: (element, I, x, y, z) - positions relative to Eu
     # H atoms (I = 1/2)
@@ -81,14 +85,14 @@ bath_spins = [
     ('H', 0.5, 0.555278, -4.133950, 0.877101),
     ('H', 0.5, -0.915200, -5.147595, 3.001573),
     # N atoms (I = 1)
-    ('N', 1.0, -1.384994, 2.250116, -0.628577),
-    ('N', 1.0, -2.227990, 0.593825, 1.386424),
-    ('N', 1.0, -2.126693, -1.528136, 2.322551),
-    ('N', 1.0, 0.880523, 1.522349, 2.381702),
-    ('N', 1.0, -0.022078, 2.509503, -2.486584),
-    ('N', 1.0, -1.423406, -1.498989, -2.100499),
-    ('N', 1.0, 0.593269, 1.338372, -2.167569),
-    ('N', 1.0, -1.183328, -1.864174, 1.399839),
+    ('N', 1.0, -1.384994, 2.250116, -0.628577),   # N10 relative to Eu
+    ('N', 1.0, -2.227990, 0.593825, 1.386424),    # N11
+    ('N', 1.0, -2.126693, -1.528136, 2.322551),   # N12
+    ('N', 1.0, 0.880523, 1.522349, 2.381702),     # N13
+    ('N', 1.0, -0.022078, 2.509503, -2.486584),   # N15
+    ('N', 1.0, -1.423406, -1.498989, -2.100499),  # N16
+    ('N', 1.0, 0.593269, 1.338372, -2.167569),    # N18
+    ('N', 1.0, -1.183328, -1.864174, 1.399839),   # N19
 ]
 
 print(f"Nuclear spin bath: {len(bath_spins)} spins (H + N on ligands)")
@@ -110,10 +114,13 @@ I_plus = qt.jmat(I, '+')
 I_minus = qt.jmat(I, '-')
 I_identity = qt.qeye(int(2*I + 1))
 
+# Hamiltonian: H = H_NQC + H_HFC (zero field)
 prefactor_NQC = (e2qQ_h * MHz_to_Hz) / (4 * I * (2*I - 1))
 H_NQC = prefactor_NQC * (3*Iz*Iz - I*(I+1)*I_identity + eta_Q*(I_plus*I_plus + I_minus*I_minus))
 
+# Hyperfine: use full tensor (diagonal approximation in principal axis frame)
 # H_HFC = A_xx*Ix^2 + A_yy*Iy^2 + A_zz*Iz^2 (simplified)
+# For nuclear spin relaxation, use the largest anisotropic component
 A_zz = A_eigenvalues[2]  # Largest magnitude component
 H_HFC = A_zz * MHz_to_Hz * Iz
 
@@ -148,6 +155,7 @@ def spectral_density(omega, T, modes):
     
     return J
 
+# Build collapse operators
 evals, evecs = H_0.eigenstates()
 collapse_ops = []
 rates = []
@@ -166,6 +174,7 @@ for i in range(len(evals)):
             rates.append(gamma_ij)
 
 # Add nuclear spin bath contribution (spectral diffusion)
+# Dipolar coupling: A_dip ≈ μ₀/(4π) * (g_I * g_bath * μ_N²) / r³
 mu_0 = constants.mu_0
 g_bath_H = 5.586  # Proton g-factor
 g_bath_N = 0.404  # 14N g-factor
@@ -184,6 +193,8 @@ for element, I_bath, x, y, z in bath_spins:
     # Dipolar coupling strength (Hz)
     A_dip = (mu_0/(4*np.pi)) * (g_N * g_bath * mu_N**2) / (r**3) / h_bar / (2*np.pi)
     
+    # Spectral diffusion rate ∝ A_dip²
+    # Simple estimate: Γ_bath ∝ Σ A_i²
     Gamma_bath += A_dip**2 / (100e6)  # Normalize by ~100 MHz
 
 # Add bath contribution to rates
@@ -208,12 +219,13 @@ E_J = evals * h_bar * 2 * np.pi
 boltzmann = np.exp(-beta_energy * E_J)
 thermal_pops = boltzmann / np.sum(boltzmann)
 
+# T1: analytical solution
 total_rate = sum(rates) if rates else 1/T1_experimental
 T1_calc = 1 / total_rate
 times_T1 = np.linspace(0, 100, 100)
 pop_T1 = thermal_pops[-1] + (1 - thermal_pops[-1]) * np.exp(-total_rate * times_T1)
 
-print(f"\nT1 (calculated) = {T1_calc:.2f} s  (exp: {T1_experimental:.2f} s, ratio: {T1_calc/T1_experimental:.2f}×)")
+print(f"\n✓ T1 (calculated) = {T1_calc:.2f} s  (exp: {T1_experimental:.2f} s, ratio: {T1_calc/T1_experimental:.2f}×)")
 print(f"\nRelaxation mechanisms: Direct phonon + Raman + nuclear spin bath estimate")
 print(f"Remaining discrepancy likely from: bath spin dynamics, Orbach (if low-lying states exist)")
 print(f"\nT2 not calculated: Redfield theory models T1 relaxation but doesn't capture")
@@ -226,18 +238,22 @@ print(f"These dominate experimental T2 = {T2_experimental*1e9:.0f} ns.")
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
 
-# Plot 1: Energy levels
+# Plot 1: Energy levels (all states labeled, spaced to avoid overlap)
+# Draw energy levels
 for i, E in enumerate(E_levels):
     ax1.hlines(E/MHz_to_Hz, 0, 1, colors='blue', linewidth=3)
 
+# Add labels with smart positioning to avoid overlap
 label_positions = []
 for i, E in enumerate(E_levels):
     m_val = I - i
     E_mhz = E / MHz_to_Hz
     
+    # Check if this position would overlap with previous labels
     min_spacing = 20  # MHz minimum spacing for labels
     y_pos = E_mhz
     
+    # Adjust position if too close to any previous label
     for prev_pos in label_positions:
         if abs(y_pos - prev_pos) < min_spacing:
             # Shift upward slightly
@@ -246,6 +262,7 @@ for i, E in enumerate(E_levels):
     ax1.text(1.15, y_pos, f'm={m_val:.1f}', fontsize=9, va='center')
     label_positions.append(y_pos)
     
+    # Draw connecting line if label was shifted
     if abs(y_pos - E_mhz) > 1:
         ax1.plot([1.05, 1.12], [E_mhz, y_pos], 'k-', linewidth=0.5, alpha=0.3)
 
@@ -265,6 +282,8 @@ ax2.legend(fontsize=9)
 ax2.grid(True, alpha=0.3)
 
 plt.tight_layout()
+plt.savefig('eu_qubit_results.png', dpi=150, bbox_inches='tight')
+print("\n✓ Plot saved: eu_qubit_results.png")
 plt.show()
 
 print("\n" + "="*70)
