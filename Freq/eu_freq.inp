@@ -1,6 +1,6 @@
 ! PBE UKS ZORA TightSCF Freq Opt
 
-%pal nprocs 8 end  # ← Use more cores if available, Freq is parallelizable
+%pal nprocs 8 end
 %maxcore 7000
 
 %basis
