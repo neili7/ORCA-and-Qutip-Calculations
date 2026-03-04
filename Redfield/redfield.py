@@ -22,7 +22,6 @@ T_BATH    = 4.2           # K
 GAM_PH_CM = 20.0          # cm⁻¹  (Raman linewidth of low-freq modes)
 
 bath_spins_raw = [
-    # (element, I, x[Å], y[Å], z[Å]) — relative to Eu, from DFT cluster
     ('H', 0.5, -4.377754,  1.147464,  3.671829),
     ('H', 0.5,  2.705193,  1.730396, -5.172580),
     ('H', 0.5, -4.524319,  3.360769,  2.498627),
@@ -46,7 +45,7 @@ bath_spins_raw = [
 ]
 
 GAMMA = {
-    '153Eu': 6.6252e6,    # rad/s/T
+    '153Eu': 6.6252e6,
     'H':     2.6752e8,
     'N':    -1.9338e7,
 }
@@ -116,42 +115,78 @@ xk      = hbar * omega_k / (k_B * T_BATH)
 n_k     = np.where(xk < 50, 1.0 / np.expm1(np.clip(xk, 1e-10, 50)), 0.0)
 
 # ══════════════════════════════════════════════════════════════════════════
-# PHONON W MATRIX  (QuTiP Bloch-Redfield tensor)
+# HELPER: build phonon W matrix with tunable parameters
 # ══════════════════════════════════════════════════════════════════════════
 T_eb_qt = np.array([[U.conj().T @ T_cart_np[i, j] @ U
                       for j in range(3)] for i in range(3)])
 
 H_diag_qt = qutip.Qobj(np.diag(evals), dims=[[DIM], [DIM]])
 
-a_ops = []
-for k in range(N_modes):
-    A_k = np.zeros((DIM, DIM), dtype=complex)
-    for i in range(3):
-        for j in range(3):
-            A_k += dV_all[k, i, j] * T_eb_qt[i, j]
-    A_k_qt = qutip.Qobj(A_k * PREFACTOR * SCALE_SI, dims=[[DIM], [DIM]])
 
-    ok, nk, gph = omega_k[k], n_k[k], GAM_PH
-    def make_S(ok=ok, nk=nk, gph=gph):
-        def S(omega):
-            Lp = (gph / np.pi) / ((omega + ok)**2 + gph**2)
-            Lm = (gph / np.pi) / ((omega - ok)**2 + gph**2)
-            return (hbar / (2 * ok)) * ((nk + 1) * Lp + nk * Lm)
-        return S
-    a_ops.append([A_k_qt, make_S()])
+def build_W_ph(gam_ph_cm_val=GAM_PH_CM, sec_cutoff_val=0.1,
+               extra_modes=None):
+    """
+    Build the phonon W matrix.
 
-R_qt, _ = qutip.bloch_redfield_tensor(H_diag_qt, a_ops,
-                                       sec_cutoff=0.1,
-                                       sparse_eigensolver=False)
-R_np = R_qt.full()
+    Parameters
+    ----------
+    gam_ph_cm_val : float  Raman linewidth in cm⁻¹
+    sec_cutoff_val : float  secular approximation cutoff (rad/s units passed
+                            directly to bloch_redfield_tensor)
+    extra_modes : list of (freq_cm, dV_tensor) pairs to append
+    """
+    gam_ph_val = gam_ph_cm_val * cm2rad
 
-W_ph = np.zeros((DIM, DIM))
-for a in range(DIM):
+    # Build coupling operators
+    use_dV = list(dV_all)
+    use_ok = list(omega_k)
+    use_nk = list(n_k)
+
+    if extra_modes is not None:
+        for (fc, dV_extra) in extra_modes:
+            ok_e = fc * cm2rad
+            xk_e = hbar * ok_e / (k_B * T_BATH)
+            nk_e = 1.0 / np.expm1(np.clip(xk_e, 1e-10, 50)) if xk_e < 50 else 0.0
+            use_dV.append(dV_extra)
+            use_ok.append(ok_e)
+            use_nk.append(nk_e)
+
+    a_ops_local = []
+    for k in range(len(use_ok)):
+        A_k = np.zeros((DIM, DIM), dtype=complex)
+        for i in range(3):
+            for j in range(3):
+                A_k += use_dV[k][i, j] * T_eb_qt[i, j]
+        A_k_qt = qutip.Qobj(A_k * PREFACTOR * SCALE_SI, dims=[[DIM], [DIM]])
+
+        ok, nk = use_ok[k], use_nk[k]
+        def make_S(ok=ok, nk=nk, gph=gam_ph_val):
+            def S(omega):
+                Lp = (gph / np.pi) / ((omega + ok)**2 + gph**2)
+                Lm = (gph / np.pi) / ((omega - ok)**2 + gph**2)
+                return (hbar / (2 * ok)) * ((nk + 1) * Lp + nk * Lm)
+            return S
+        a_ops_local.append([A_k_qt, make_S()])
+
+    R_qt_l, _ = qutip.bloch_redfield_tensor(H_diag_qt, a_ops_local,
+                                             sec_cutoff=sec_cutoff_val,
+                                             sparse_eigensolver=False)
+    R_np_l = R_qt_l.full()
+
+    W = np.zeros((DIM, DIM))
+    for a in range(DIM):
+        for b in range(DIM):
+            if a != b:
+                W[a, b] = np.real(R_np_l[a * DIM + a, b * DIM + b])
     for b in range(DIM):
-        if a != b:
-            W_ph[a, b] = np.real(R_np[a * DIM + a, b * DIM + b])
-for b in range(DIM):
-    W_ph[b, b] = -np.sum(W_ph[:, b])
+        W[b, b] = -np.sum(W[:, b])
+    return W
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# BASELINE W_ph  (nominal parameters)
+# ══════════════════════════════════════════════════════════════════════════
+W_ph = build_W_ph()
 
 # ══════════════════════════════════════════════════════════════════════════
 # BATH SPIN CORRELATION TIMES
@@ -226,6 +261,19 @@ def dipolar_W_contribution(bath_spins, gamma_bath, I_bath, tau_bath):
         W_dip[b_idx, b_idx] = -np.sum(W_dip[:, b_idx])
     return W_dip
 
+
+def build_W_dip(tau_H_val, tau_N_val):
+    H_spins_m = [np.array([x,y,z])*ANG2M for (el,I,x,y,z) in bath_spins_raw if el=='H']
+    N_spins_m = [np.array([x,y,z])*ANG2M for (el,I,x,y,z) in bath_spins_raw if el=='N']
+    W_H = dipolar_W_contribution(H_spins_m, GAMMA['H'], 0.5, tau_H_val)
+    W_N = dipolar_W_contribution(N_spins_m, GAMMA['N'], 1.0, tau_N_val)
+    W   = W_H + W_N
+    np.fill_diagonal(W, 0.0)
+    for b_idx in range(DIM):
+        W[b_idx, b_idx] = -np.sum(W[:, b_idx])
+    return W
+
+
 H_spins_m = [np.array([x,y,z])*ANG2M for (el,I,x,y,z) in bath_spins_raw if el=='H']
 N_spins_m = [np.array([x,y,z])*ANG2M for (el,I,x,y,z) in bath_spins_raw if el=='N']
 
@@ -242,12 +290,14 @@ for b_idx in range(DIM):
 # ══════════════════════════════════════════════════════════════════════════
 W_total = W_ph + W_dip
 
+
 def extract_T1s(W):
     ev    = np.linalg.eigvals(W)
     rates = np.sort([-np.real(v) for v in ev
                      if -np.real(v) > np.max(np.abs(np.real(ev))) * 1e-6
                      and abs(np.imag(v)) < abs(np.real(v)) * 0.01])
     return [1/r for r in rates], list(rates)
+
 
 T1_ph,  rates_ph  = extract_T1s(W_ph)
 T1_tot, rates_tot = extract_T1s(W_total)
@@ -287,9 +337,151 @@ print(f"\n  Max off-diagonal rates:")
 print(f"    Phonon:   {W_ph_od.max():.3e} s⁻¹")
 print(f"    Dipolar:  {W_dip_od.max():.3e} s⁻¹")
 
+
 # ══════════════════════════════════════════════════════════════════════════
-# FIGURE
+# Secular cutoff sweep
 # ══════════════════════════════════════════════════════════════════════════
+print("\n" + "="*68)
+print("  SECULAR CUTOFF SWEEP")
+print("="*68)
+sec_cutoffs  = [0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
+sec_T1_long  = []
+sec_T1_short = []
+sec_ratio    = []
+
+for sc in sec_cutoffs:
+    W_sc   = build_W_ph(sec_cutoff_val=sc) + W_dip
+    T1_sc, _ = extract_T1s(W_sc)
+    if len(T1_sc) >= 2:
+        sec_T1_long.append(T1_sc[0])
+        sec_T1_short.append(T1_sc[-1])
+        sec_ratio.append(T1_sc[0] / T1_sc[-1])
+    else:
+        sec_T1_long.append(np.nan)
+        sec_T1_short.append(np.nan)
+        sec_ratio.append(np.nan)
+    print(f"  sec_cutoff={sc:5.3f}  T1_long={sec_T1_long[-1]:7.2f} s  "
+          f"T1_short={sec_T1_short[-1]:7.3f} s  ratio={sec_ratio[-1]:6.1f}×")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# γ_ph sweep + 3. Raman % effect
+# ══════════════════════════════════════════════════════════════════════════
+print("\n" + "="*68)
+print("  γ_ph SWEEP  (Raman linewidth sensitivity)")
+print("="*68)
+gam_vals_cm  = [1, 5, 10, 20, 50, 100, 200, 500]
+gam_T1_long  = []
+gam_T1_short = []
+gam_ratio    = []
+
+for gc in gam_vals_cm:
+    W_gc   = build_W_ph(gam_ph_cm_val=gc) + W_dip
+    T1_gc, _ = extract_T1s(W_gc)
+    if len(T1_gc) >= 2:
+        gam_T1_long.append(T1_gc[0])
+        gam_T1_short.append(T1_gc[-1])
+        gam_ratio.append(T1_gc[0] / T1_gc[-1])
+    else:
+        gam_T1_long.append(np.nan)
+        gam_T1_short.append(np.nan)
+        gam_ratio.append(np.nan)
+    print(f"  γ_ph={gc:4d} cm⁻¹  T1_long={gam_T1_long[-1]:7.2f} s  "
+          f"T1_short={gam_T1_short[-1]:7.3f} s  ratio={gam_ratio[-1]:6.1f}×")
+
+# Raman % effect: change from 1 cm-1 to 500 cm-1
+raman_effect_long  = 100 * (gam_T1_long[-1]  - gam_T1_long[0])  / gam_T1_long[0]
+raman_effect_short = 100 * (gam_T1_short[-1] - gam_T1_short[0]) / gam_T1_short[0]
+print(f"\n  [Raman % effect: γ_ph 1→500 cm⁻¹]")
+print(f"    T1_long  shift: {raman_effect_long:+.1f}%")
+print(f"    T1_short shift: {raman_effect_short:+.1f}%")
+print(f"    The Raman linewidth γ_ph has a {'large' if abs(raman_effect_long)>20 else 'modest'} "
+      f"effect on T1_long ({abs(raman_effect_long):.1f}% variation) and "
+      f"a {'large' if abs(raman_effect_short)>20 else 'modest'} effect on T1_short "
+      f"({abs(raman_effect_short):.1f}% variation) over the full range 1–500 cm⁻¹.")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Artificial low-frequency phonon test
+# ══════════════════════════════════════════════════════════════════════════
+print("\n" + "="*68)
+print("  ARTIFICIAL LOW-FREQUENCY PHONON TEST")
+print("="*68)
+# Use mean dV tensor of all modes as a proxy coupling for the injected mode
+dV_mean = dV_all.mean(axis=0)
+
+lf_freqs_cm = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+lf_T1_long  = []
+lf_T1_short = []
+lf_ratio    = []
+
+for lf in lf_freqs_cm:
+    extra = [(lf, dV_mean)]
+    W_lf  = build_W_ph(extra_modes=extra) + W_dip
+    T1_lf, _ = extract_T1s(W_lf)
+    if len(T1_lf) >= 2:
+        lf_T1_long.append(T1_lf[0])
+        lf_T1_short.append(T1_lf[-1])
+        lf_ratio.append(T1_lf[0] / T1_lf[-1])
+    else:
+        lf_T1_long.append(np.nan)
+        lf_T1_short.append(np.nan)
+        lf_ratio.append(np.nan)
+    print(f"  LF phonon @ {lf:5.1f} cm⁻¹  T1_long={lf_T1_long[-1]:7.2f} s  "
+          f"T1_short={lf_T1_short[-1]:7.3f} s  ratio={lf_ratio[-1]:6.1f}×")
+
+print(f"\n  Baseline (no LF phonon): T1_long={T1_long_tot:.2f} s  "
+      f"T1_short={T1_short_tot:.3f} s  ratio={T1_long_tot/T1_short_tot:.1f}×")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# τ_H and τ_N ± factor-of-2 sensitivity
+# ══════════════════════════════════════════════════════════════════════════
+print("\n" + "="*68)
+print("  τ_H / τ_N  SENSITIVITY  (±2×)")
+print("="*68)
+
+tau_factors = [0.25, 0.5, 1.0, 2.0, 4.0]
+tau_labels  = ['÷4', '÷2', '×1 (nominal)', '×2', '×4']
+
+sens_results = {}
+for label, factor_H, vary_H in [('τ_H varied', True, True),
+                                  ('τ_N varied', False, True)]:
+    row_long  = []
+    row_short = []
+    row_ratio = []
+    for fac in tau_factors:
+        t_H = tau_H * (fac if vary_H and label == 'τ_H varied' else 1.0)
+        t_N = tau_N * (fac if not vary_H and label == 'τ_N varied' else 1.0)
+        # For τ_N varied, fix τ_H and vice-versa
+        if label == 'τ_H varied':
+            t_H = tau_H * fac
+            t_N = tau_N
+        else:
+            t_H = tau_H
+            t_N = tau_N * fac
+        W_s = W_ph + build_W_dip(t_H, t_N)
+        T1_s, _ = extract_T1s(W_s)
+        if len(T1_s) >= 2:
+            row_long.append(T1_s[0]);  row_short.append(T1_s[-1])
+            row_ratio.append(T1_s[0]/T1_s[-1])
+        else:
+            row_long.append(np.nan);  row_short.append(np.nan);  row_ratio.append(np.nan)
+    sens_results[label] = (row_long, row_short, row_ratio)
+    print(f"\n  {label}:")
+    for lbl, tl, ts, tr in zip(tau_labels, row_long, row_short, row_ratio):
+        marker = ' ◄ nominal' if lbl == '×1 (nominal)' else ''
+        print(f"    {lbl:18s}  T1_long={tl:7.2f} s  T1_short={ts:7.3f} s  ratio={tr:6.1f}×{marker}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# FIGURES
+# ══════════════════════════════════════════════════════════════════════════
+t_arr = np.concatenate([np.linspace(0, 2, 80),
+                        np.linspace(2, 100, 80)[1:],
+                        np.linspace(100, 400, 60)[1:]])
+
+# ─── Figure 1: 6-panel ──────────────────────────────────────────
 fig, axes = plt.subplots(2, 3, figsize=(15, 9))
 fig.suptitle(
     r"Eu(dpphen)(NO$_3$)$_3$ — $^{153}$Eu NQR spin-lattice relaxation"
@@ -298,10 +490,6 @@ fig.suptitle(
     r"$\eta=$"  + f"{ETA_Q:.4f},  "
     r"$T=$"     + f"{T_BATH} K",
     fontsize=12, fontweight='bold')
-
-t_arr = np.concatenate([np.linspace(0, 2, 80),
-                        np.linspace(2, 100, 80)[1:],
-                        np.linspace(100, 400, 60)[1:]])
 
 # (a) Recovery curves
 ax = axes[0, 0]
@@ -376,8 +564,8 @@ ax.legend(handles=[Patch(facecolor='steelblue', label='¹H'),
 ax = axes[1, 2]
 models = ['Experiment', 'Phonon\nonly', '+ Dipolar\nbath', '+ Crystal\nphonons\n(needed)']
 ratios = [134, T1_long_ph/T1_short_ph, T1_long_tot/T1_short_tot, 134]
-colors = ['crimson', 'steelblue', 'darkorange', 'gray']
-bars   = ax.bar(models, ratios, color=colors, edgecolor='k', lw=0.8)
+colors_f = ['crimson', 'steelblue', 'darkorange', 'gray']
+bars   = ax.bar(models, ratios, color=colors_f, edgecolor='k', lw=0.8)
 bars[-1].set_alpha(0.3)
 ax.axhline(134, color='crimson', ls='--', lw=1.5, alpha=0.5)
 for bar, ratio in zip(bars, ratios):
@@ -390,4 +578,127 @@ ax.grid(True, alpha=0.2, axis='y'); ax.set_ylim(0, 155)
 
 plt.tight_layout()
 plt.show()
+
+
+# ─── Figure 2: More analyses ───────────────────────────────────────────────
+fig2, axes2 = plt.subplots(2, 2, figsize=(14, 10))
+fig2.suptitle(
+    r"Eu(dpphen)(NO$_3$)$_3$ — Sensitivity & parameter sweep analyses",
+    fontsize=13, fontweight='bold')
+
+# ── Panel A: Secular cutoff sweep ────────────────────────────────────────
+ax = axes2[0, 0]
+ax.semilogx(sec_cutoffs, sec_T1_long,  'o-', color='steelblue',  lw=2,
+            ms=7, label=r'$T_{1,\mathrm{long}}$')
+ax.semilogx(sec_cutoffs, sec_T1_short, 's-', color='darkorange', lw=2,
+            ms=7, label=r'$T_{1,\mathrm{short}}$')
+ax2r = ax.twinx()
+ax2r.semilogx(sec_cutoffs, sec_ratio, '^--', color='forestgreen', lw=1.5,
+              ms=6, alpha=0.7, label='Ratio')
+ax2r.set_ylabel(r'$T_{1,\mathrm{long}}/T_{1,\mathrm{short}}$', color='forestgreen')
+ax2r.tick_params(axis='y', labelcolor='forestgreen')
+ax.axvline(0.1, color='gray', ls=':', lw=1.5, label='Nominal (0.1)')
+ax.axhline(41.39, color='crimson',  ls='--', lw=1, alpha=0.6)
+ax.axhline(0.31,  color='navy',     ls='--', lw=1, alpha=0.6)
+ax.set_xlabel(r'Secular cutoff (rad s$^{-1}$)')
+ax.set_ylabel('T1 (s)')
+ax.set_title('(A) Secular cutoff sweep')
+lines1, labs1 = ax.get_legend_handles_labels()
+lines2, labs2 = ax2r.get_legend_handles_labels()
+ax.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc='upper left')
+ax.grid(True, alpha=0.2)
+
+# ── Panel B: γ_ph sweep ──────────────────────────────────────────────────
+ax = axes2[0, 1]
+ax.semilogx(gam_vals_cm, gam_T1_long,  'o-', color='steelblue',  lw=2,
+            ms=7, label=r'$T_{1,\mathrm{long}}$')
+ax.semilogx(gam_vals_cm, gam_T1_short, 's-', color='darkorange', lw=2,
+            ms=7, label=r'$T_{1,\mathrm{short}}$')
+ax_r = ax.twinx()
+ax_r.semilogx(gam_vals_cm, gam_ratio, '^--', color='forestgreen', lw=1.5,
+              ms=6, alpha=0.7, label='Ratio')
+ax_r.set_ylabel(r'$T_{1,\mathrm{long}}/T_{1,\mathrm{short}}$', color='forestgreen')
+ax_r.tick_params(axis='y', labelcolor='forestgreen')
+ax.axvline(GAM_PH_CM, color='gray', ls=':', lw=1.5, label=f'Nominal ({GAM_PH_CM} cm⁻¹)')
+ax.axhline(41.39, color='crimson',  ls='--', lw=1, alpha=0.6)
+ax.axhline(0.31,  color='navy',     ls='--', lw=1, alpha=0.6)
+ax.set_xlabel(r'$\gamma_\mathrm{ph}$ (cm$^{-1}$)')
+ax.set_ylabel('T1 (s)')
+ax.set_title(r'(B) $\gamma_\mathrm{ph}$ sweep (Raman linewidth)')
+# Annotate Raman % effect
+ax.text(0.98, 0.05,
+        f"Raman effect (1→500 cm⁻¹):\n"
+        f"  T₁_long:  {raman_effect_long:+.1f}%\n"
+        f"  T₁_short: {raman_effect_short:+.1f}%",
+        transform=ax.transAxes, ha='right', va='bottom',
+        fontsize=8.5, family='monospace',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', alpha=0.9))
+lines1, labs1 = ax.get_legend_handles_labels()
+lines2, labs2 = ax_r.get_legend_handles_labels()
+ax.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc='upper right',
+          bbox_to_anchor=(0.98, 0.98))
+ax.grid(True, alpha=0.2)
+
+# ── Panel C: Low-frequency phonon test ───────────────────────────────────
+ax = axes2[1, 0]
+ax.semilogx(lf_freqs_cm, lf_T1_long,  'o-', color='steelblue',  lw=2,
+            ms=7, label=r'$T_{1,\mathrm{long}}$')
+ax.semilogx(lf_freqs_cm, lf_T1_short, 's-', color='darkorange', lw=2,
+            ms=7, label=r'$T_{1,\mathrm{short}}$')
+ax3r = ax.twinx()
+ax3r.semilogx(lf_freqs_cm, lf_ratio, '^--', color='forestgreen', lw=1.5,
+              ms=6, alpha=0.7, label='Ratio')
+ax3r.set_ylabel(r'$T_{1,\mathrm{long}}/T_{1,\mathrm{short}}$', color='forestgreen')
+ax3r.tick_params(axis='y', labelcolor='forestgreen')
+ax.axhline(T1_long_tot,  color='steelblue',  ls=':', lw=1.5, alpha=0.5,
+           label='Baseline (no LF)')
+ax.axhline(T1_short_tot, color='darkorange', ls=':', lw=1.5, alpha=0.5)
+ax.axhline(41.39, color='crimson', ls='--', lw=1, alpha=0.6)
+ax.axhline(0.31,  color='navy',    ls='--', lw=1, alpha=0.6)
+ax.set_xlabel(r'Injected LF phonon frequency (cm$^{-1}$)')
+ax.set_ylabel('T1 (s)')
+ax.set_title('(C) Artificial low-frequency phonon test\n(mean-coupling mode injected)')
+lines1, labs1 = ax.get_legend_handles_labels()
+lines2, labs2 = ax3r.get_legend_handles_labels()
+ax.legend(lines1 + lines2, labs1 + labs2, fontsize=8)
+ax.grid(True, alpha=0.2)
+
+# ── Panel D: τ_H / τ_N factor-of-2 sensitivity ───────────────────────────
+ax = axes2[1, 1]
+x_pos    = np.log2(tau_factors)  # -2, -1, 0, 1, 2
+x_labels = tau_labels
+
+tH_long,  tH_short,  tH_ratio  = sens_results['τ_H varied']
+tN_long,  tN_short,  tN_ratio  = sens_results['τ_N varied']
+
+ax.plot(x_pos, tH_long,  'o-',  color='steelblue',   lw=2, ms=7,
+        label=r'$T_{1,\mathrm{long}}$ (τ$_H$ varied)')
+ax.plot(x_pos, tH_short, 's--', color='steelblue',   lw=2, ms=7, alpha=0.6,
+        label=r'$T_{1,\mathrm{short}}$ (τ$_H$ varied)')
+ax.plot(x_pos, tN_long,  'o-',  color='tomato',      lw=2, ms=7,
+        label=r'$T_{1,\mathrm{long}}$ (τ$_N$ varied)')
+ax.plot(x_pos, tN_short, 's--', color='tomato',      lw=2, ms=7, alpha=0.6,
+        label=r'$T_{1,\mathrm{short}}$ (τ$_N$ varied)')
+
+ax4r = ax.twinx()
+ax4r.plot(x_pos, tH_ratio, '^:', color='steelblue', lw=1.5, ms=5, alpha=0.5)
+ax4r.plot(x_pos, tN_ratio, '^:', color='tomato',    lw=1.5, ms=5, alpha=0.5)
+ax4r.set_ylabel(r'$T_{1,\mathrm{long}}/T_{1,\mathrm{short}}$ (dotted)',
+                color='gray', fontsize=8)
+ax4r.tick_params(axis='y', labelcolor='gray')
+
+ax.axhline(41.39, color='crimson', ls='--', lw=1, alpha=0.6, label='Exp. 41 s')
+ax.axhline(0.31,  color='navy',    ls='--', lw=1, alpha=0.6, label='Exp. 0.31 s')
+ax.axvline(0, color='gray', ls=':', lw=1.5)
+ax.set_xticks(x_pos)
+ax.set_xticklabels(x_labels, fontsize=8)
+ax.set_xlabel(r'Scaling factor for $\tau$ (log$_2$ axis)')
+ax.set_ylabel('T1 (s)')
+ax.set_title(r'(D) $\tau_H$ and $\tau_N$ ± factor-of-2 sensitivity')
+ax.legend(fontsize=7.5, loc='upper left')
+ax.grid(True, alpha=0.2)
+
+plt.tight_layout()
+plt.show()
+
 print("\nCOMPLETE")
